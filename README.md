@@ -1,16 +1,18 @@
+Note: This project is a fork from ``clemfromspace/scrapy-selenium`` and currently in alpha status!!!
+
 # Scrapy with selenium
-[![PyPI](https://img.shields.io/pypi/v/scrapy-selenium.svg)](https://pypi.python.org/pypi/scrapy-selenium) [![Build Status](https://travis-ci.org/clemfromspace/scrapy-selenium.svg?branch=master)](https://travis-ci.org/clemfromspace/scrapy-selenium) [![Test Coverage](https://api.codeclimate.com/v1/badges/5c737098dc38a835ff96/test_coverage)](https://codeclimate.com/github/clemfromspace/scrapy-selenium/test_coverage) [![Maintainability](https://api.codeclimate.com/v1/badges/5c737098dc38a835ff96/maintainability)](https://codeclimate.com/github/clemfromspace/scrapy-selenium/maintainability)
 
-Scrapy middleware to handle javascript pages using selenium.
 
-## Installation
+Scrapy middleware to handle javascript pages using selenium webdriver driven chromium.
+
+## Installation (deprecated)
 ```
 $ pip install scrapy-selenium
 ```
 You should use **python>=3.6**. 
 You will also need one of the Selenium [compatible browsers](http://www.seleniumhq.org/about/platforms.jsp).
 
-## Configuration
+## Configuration (deprecated)
 1. Add the browser to use, the path to the driver executable, and the arguments to pass to the executable to the scrapy settings:
     ```python
     from shutil import which
@@ -31,7 +33,7 @@ Optionally, set the path to the browser executable:
         'scrapy_selenium.SeleniumMiddleware': 800
     }
     ```
-## Usage
+## Usage (deprecated)
 Use the `scrapy_selenium.SeleniumRequest` instead of the scrapy built-in `Request` like below:
 ```python
 from scrapy_selenium import SeleniumRequest
@@ -51,7 +53,7 @@ def parse_result(self, response):
     print(response.selector.xpath('//title/@text'))
 ```
 
-### Additional arguments
+### Additional arguments (deprecated)
 The `scrapy_selenium.SeleniumRequest` accept 4 additional arguments:
 
 #### `wait_time` / `wait_until`

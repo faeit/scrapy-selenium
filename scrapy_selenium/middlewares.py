@@ -1,121 +1,216 @@
-"""This module contains the ``SeleniumMiddleware`` scrapy middleware"""
+# -*- coding: utf-8 -*-
+from selenium.webdriver.chrome.options import Options
+# from seleniumwire.proxy.modifier import RequestModifier
 
-from importlib import import_module
+import os, random, logging
 
 from scrapy import signals
-from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse
-from selenium.webdriver.support.ui import WebDriverWait
 
-from .http import SeleniumRequest
+from twisted.internet import reactor, defer, task
+from twisted.internet.defer import inlineCallbacks
+
+from .evasions import EvasionMeasureFactory
+from .cdpwebdriver import Chrome
+from .helpers import deferredsleep
 
 
-class SeleniumMiddleware:
-    """Scrapy middleware handling the requests using selenium"""
-
-    def __init__(self, driver_name, driver_executable_path, driver_arguments,
-        browser_executable_path):
-        """Initialize the selenium webdriver
-
-        Parameters
-        ----------
-        driver_name: str
-            The selenium ``WebDriver`` to use
-        driver_executable_path: str
-            The path of the executable binary of the driver
-        driver_arguments: list
-            A list of arguments to initialize the driver
-        browser_executable_path: str
-            The path of the executable binary of the browser
-        """
-
-        webdriver_base_path = f'selenium.webdriver.{driver_name}'
-
-        driver_klass_module = import_module(f'{webdriver_base_path}.webdriver')
-        driver_klass = getattr(driver_klass_module, 'WebDriver')
-
-        driver_options_module = import_module(f'{webdriver_base_path}.options')
-        driver_options_klass = getattr(driver_options_module, 'Options')
-
-        driver_options = driver_options_klass()
-        if browser_executable_path:
-            driver_options.binary_location = browser_executable_path
-        for argument in driver_arguments:
-            driver_options.add_argument(argument)
-
-        driver_kwargs = {
-            'executable_path': driver_executable_path,
-            f'{driver_name}_options': driver_options
-        }
-
-        self.driver = driver_klass(**driver_kwargs)
+class SeleniumChromeDownloaderMiddleware(object):
 
     @classmethod
     def from_crawler(cls, crawler):
-        """Initialize the middleware with the crawler settings"""
-
-        driver_name = crawler.settings.get('SELENIUM_DRIVER_NAME')
-        driver_executable_path = crawler.settings.get('SELENIUM_DRIVER_EXECUTABLE_PATH')
-        browser_executable_path = crawler.settings.get('SELENIUM_BROWSER_EXECUTABLE_PATH')
-        driver_arguments = crawler.settings.get('SELENIUM_DRIVER_ARGUMENTS')
-
-        if not driver_name or not driver_executable_path:
-            raise NotConfigured(
-                'SELENIUM_DRIVER_NAME and SELENIUM_DRIVER_EXECUTABLE_PATH must be set'
-            )
-
-        middleware = cls(
-            driver_name=driver_name,
-            driver_executable_path=driver_executable_path,
-            driver_arguments=driver_arguments,
-            browser_executable_path=browser_executable_path
-        )
-
-        crawler.signals.connect(middleware.spider_closed, signals.spider_closed)
-
+        """
+        This method is used by Scrapy to create your spiders. Crawler settings will be forwarded to the spider middleware.
+        :param crawler:
+        :return: The instantiated spider middleware
+        """
+        middleware = cls(crawler.settings)
+        crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
+        crawler.signals.connect(middleware.spider_closed, signal=signals.spider_closed)
         return middleware
 
+    def __init__(self, settings):
+        """
+
+        :param settings:
+                apply_evasions: bool
+            If True, various evasions in evasions/*.js are applied before page is visited
+        """
+        self.amount_drivers = int(settings.get('SELENIUM_MAX_BROWSERS_AVAILABLE'))
+        self.browser_slots = defer.DeferredSemaphore(self.amount_drivers)
+        self.concurrent_slots = defer.DeferredSemaphore(settings.get('CONCURRENT_REQUESTS'))
+        self.delay = settings.get('DOWNLOAD_DELAY')
+        self.randomize_delay = settings.get('RANDOMIZE_DOWNLOAD_DELAY')
+        self.drivers = []
+        self.screenshot_id = 0
+        self.location = settings.get('SELENIUM_CHROME_GEOLOCATION')
+        self.apply_evasions = settings.get('SELENIUM_CHROME_APPLY_EVASIONS')
+
+        # FIXME: consider using chromedev tools request interception as an alternative to seleniumwire (maybe reference to pyppetteer or selenium java branch)
+        # override seleniumwire request interception function with custom one
+        # RequestModifier._rewrite_url = _rewrite_url
+
+        chrome_options = Options()
+        chrome_options.binary_location = settings.get('SELENIUM_CHROME_BINARY')
+        # custom profile settings, FIXME: should be configurable via spider
+        prefs = {
+            "profile.managed_default_content_settings.geolocation": 1,
+        }
+        chrome_options.add_experimental_option("prefs", prefs)
+
+        # FIXME: if needed customize user profile?
+        # userProfile = "C:/a/b/profile"
+        # chrome_options.add_argument('user-data-dir=' + userProfile)
+
+        headless = settings.get('SELENIUM_CHROME_HEADLESS')
+
+        if headless:
+            chrome_options.add_argument("--headless")
+
+        # FIXME: workaround for correct header in headless mode (refer to ... and ... )
+        chrome_options.add_argument("--lang=de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7")
+
+        for parameter in settings.get('SELENIUM_CHROME_PARAMETERS'):
+            chrome_options.add_argument(parameter)
+
+        # start browsers
+        for i in range(self.amount_drivers):
+            driver = Chrome(
+            executable_path=settings.get('SELENIUM_CHROMEDRIVER_BINARY'),
+            chrome_options=chrome_options,
+            service_args=["--verbose", "--log-path=C:/chrome/qc%d.log" % (i)] # FIXME: should be configurable via spider
+            )
+            self.drivers.append(driver)
+
+            # apply javascript evasion measures
+            if self.apply_evasions:
+                for evasion in EvasionMeasureFactory.from_directory():
+                    driver.add_script(evasion.javascript)
+
+            # adapt geolocation to provided one
+            driver.override_location(self.location)
+
+    def __del__(self):
+        """
+        Destructor
+        :return:
+        """
+        for driver in self.drivers:
+            driver.close()
+
+    @inlineCallbacks
     def process_request(self, request, spider):
-        """Process a request using the selenium driver if applicable"""
+        """
 
-        if not isinstance(request, SeleniumRequest):
-            return None
+        :param request:
+        :param spider:
+        :return:
+        Must either:
+         - return None: continue processing this request
+         - or return a Response object
+         - or return a Request object
+         - or raise IgnoreRequest: process_exception() methods of
+           installed downloader middleware will be called
+        FIXME/TODO: allow eager page visits
+        """
 
-        self.driver.get(request.url)
+        if 'selenium' not in request.meta:
+            return
 
-        for cookie_name, cookie_value in request.cookies.items():
-            self.driver.add_cookie(
-                {
-                    'name': cookie_name,
-                    'value': cookie_value
-                }
-            )
+        # aquire concurrent-access-lock
+        spider.logger.debug('process_request: aquire concurrent-access-lock for request %s' % request)
+        yield self.concurrent_slots.acquire()
+        spider.logger.debug('process_request: concurrent-access-lock for request %s aquired' % request)
 
-        if request.wait_until:
-            WebDriverWait(self.driver, request.wait_time).until(
-                request.wait_until
-            )
+        # aquire browser-slot-lock and associated driver
+        spider.logger.debug('process_request: browser-slot-lock for request %s aquired' % request)
+        yield self.browser_slots.acquire()
+        spider.logger.debug('process_request: browser-slot-lock for request %s aquired' % request)
+        # retrieve a free driver from queue FIXME: is this really thread-safe?
+        driver = self.drivers.pop(0)
 
-        if request.screenshot:
-            request.meta['screenshot'] = self.driver.get_screenshot_as_png()
+        selenium_options = request.meta['selenium']
+        # TODO: set google specific fix/cookie only on google pages FIXME: generalize such page-specific preparations
+        if selenium_options.get('fake_google_uule'):
+            driver.override_location_google_uule_cookie(self.location)
 
-        if request.script:
-            self.driver.execute_script(request.script)
+        # call the website
+        driver.get(request.url)
 
-        body = str.encode(self.driver.page_source)
+        # apply provided interaction step
+        if request.selenium_action:
+            request.selenium_action.apply_action(driver, request)
 
-        # Expose the driver via the "meta" attribute
-        request.meta.update({'driver': self.driver})
+        # make a screenshot if required
+        if not selenium_options.get('screenshot'):
+            screenshot_filename = 'shot%d.png' % (self.screenshot_id)
+            screenshot_path = os.path.join(os.getcwd(), 'screenshots', screenshot_filename)
+            selenium_options['screenshot_id'] = screenshot_filename
+            driver.capture_screenshot(screenshot_path)
+            self.screenshot_id += 1
+            spider.logger.info('Screenshot saved at: %s' % screenshot_path)
 
-        return HtmlResponse(
-            self.driver.current_url,
-            body=body,
-            encoding='utf-8',
-            request=request
-        )
+        # return html result for request with provided interaction
+        new_body = driver.page_source
+        # FIXME: Return custom response object
+        new_response = HtmlResponse(url=request.url,
+                                    status=200,
+                                    body=new_body,
+                                    request=request,
+                                    encoding='utf-8',
+                                    headers={'Content-Type': 'text/html; charset=utf-8'})
 
-    def spider_closed(self):
-        """Shutdown the driver when spider is closed"""
+        driver.remove_history()  # remove temporary stuff FIXME: may add some measures
 
-        self.driver.quit()
+        # delay operation FIXME: maybe use scrapys delay logic by overriding downloader
+        yield task.deferLater(reactor, self.download_delay(), deferredsleep, 1)
+
+        self.drivers.append(driver)
+        # release driver and associated browser-access-lock
+        spider.logger.info('release lock: %s' % spider.name)
+        self.browser_slots.release()
+        spider.logger.info('lock released: %s' % spider.name)
+        # release concurrent-access-lock
+
+        return new_response
+
+    def process_exception(self, request, exception, spider):
+        """
+        Called when a download handler or a process_request()
+        (from other downloader middleware) raises an exception.
+        :param request:
+        :param exception:
+        :param spider:
+        :return: Must either:
+         - return None: continue processing this exception
+         - return a Response object: stops process_exception() chain
+         - return a Request object: stops process_exception() chain
+        """
+        pass
+
+    def spider_opened(self, spider):
+        """
+
+        :param spider:
+        :return:
+        """
+        spider.logger.info('Spider opened: %s' % spider.name)
+
+    def spider_closed(self, spider):
+        """
+
+        :param spider:
+        :return:
+        """
+        spider.logger.info('Spider closed: %s' % spider.name)
+
+    def download_delay(self):
+        """
+
+        :return:
+        """
+        if self.randomize_delay:
+            return random.uniform(0.5 * self.delay, 1.5 * self.delay)
+        return self.delay
+
 
